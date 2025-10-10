@@ -11,6 +11,7 @@ import logging.handlers
 import spotipy
 import spotipy.util as util
 from difflib import SequenceMatcher
+from spotipy.oauth2 import SpotifyOAuth
 from termcolor import colored
 
 def parse_arguments():
@@ -29,6 +30,17 @@ def load_playlist_file(playlist_file):
         sys.exit(1)
     else:
         for track in content:
+            if not os.path.exists(track):
+                playlist_folder = os.path.dirname(playlist_file.name)
+                track_fullpath = os.path.join(playlist_folder, track)
+                if os.path.exists(track_fullpath):
+                    track = track_fullpath
+                else:
+                    playlist_folder = os.getcwd()
+                    track_fullpath = os.path.join(playlist_folder, track)
+                    if os.path.exists(track_fullpath):
+                        track = track_fullpath
+
             tracks.append({'path': track})
         return tracks
 
@@ -118,9 +130,56 @@ def format_track_info(track):
         formatted_spotify
     )
 
+
 if __name__ == "__main__":
     args = parse_arguments()
-    sp = spotipy.Spotify()
+    spotify_username = args.username
+    # these environment variables should be set
+    # you can create a spotify client id & secret on https://developer.spotify.com/dashboard/
+    # use redirect url 'http://127.0.0.1:8888/callback' (can be non-existing)
+    SPOTIPY_CLIENT_ID = os.getenv("SPOTIPY_CLIENT_ID")
+    SPOTIPY_CLIENT_SECRET = os.getenv("SPOTIPY_CLIENT_SECRET")
+    SPOTIPY_REDIRECT_URI = os.getenv("SPOTIPY_REDIRECT_URI")
+
+    if not SPOTIPY_CLIENT_ID or not SPOTIPY_CLIENT_SECRET or not SPOTIPY_REDIRECT_URI:
+        print("Environment variables SPOTIPY_CLIENT_ID, SPOTIPY_CLIENT_SECRET or SPOTIPY_REDIRECT_URI not set.\n")
+        print("On windows powershell eg.: setx SPOTIPY_CLIENT_ID \"your client id\'")
+        print("On linux eg.: export SPOTIPY_CLIENT_ID=\"your client id\"\n")
+        print("You can create a spotify client id & secret on https://developer.spotify.com/dashboard/")
+        print("For SPOTIPY_REDIRECT_URI, use value 'http://127.0.0.1:8888/callback' (or similar)")
+        exit()
+
+    SCOPE = (
+        "user-read-private "
+        "user-read-email "
+        "user-read-playback-state "
+        "user-modify-playback-state "
+        "user-read-currently-playing "
+        "user-read-recently-played "
+        "user-top-read "
+        "user-library-read "
+        "user-library-modify "
+        "playlist-read-private "
+        "playlist-read-collaborative "
+        "playlist-modify-public "
+        "playlist-modify-private "
+        "user-follow-read "
+        "user-follow-modify "
+        "app-remote-control "
+        "streaming "
+        "user-read-playback-position"
+    )
+    # authenticate, first time a browser window will open and a .cache-[username] file will be created
+    sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
+        client_id=SPOTIPY_CLIENT_ID,
+        client_secret=SPOTIPY_CLIENT_SECRET,
+        redirect_uri=SPOTIPY_REDIRECT_URI,
+        username=spotify_username,
+        scope=SCOPE
+    ))
+
+    user = sp.current_user()
+    print(f"Logged-in As: {user['display_name']} ({user['id']})")
 
     logger = logging.getLogger(__name__)
     if args.debug:
@@ -133,7 +192,7 @@ if __name__ == "__main__":
 
     tracks = load_playlist_file(args.file)
 
-    print colored('Parsed %s tracks from %s' % (len(tracks), args.file.name), 'green')
+    print(colored('Parsed %s tracks from %s' % (len(tracks), args.file.name), 'green'))
 
     for track in tracks:
         track['id3_data'] = read_id3_tags(track['path'])
@@ -141,35 +200,29 @@ if __name__ == "__main__":
             track['guess'] = guess_missing_track_info(track['path'])
         track['spotify_data'] = find_spotify_track(track)
 
-        print format_track_info(track)
+        print(format_track_info(track))
 
     spotify_tracks = [ k['spotify_data']['id'] for k in tracks if k.get('spotify_data') ]
     spotify_playlist_name = args.file.name
-    spotify_username = args.username
 
     if len(spotify_tracks) < 1:
-        print '\nNo tracks matched on Spotify'
+        print('\nNo tracks matched on Spotify')
         sys.exit(0)
 
-    print '\n%s/%s of tracks matched on Spotify, creating playlist "%s" on Spotify...' % (len(spotify_tracks), len(tracks), spotify_playlist_name),
+    print('\n%s/%s of tracks matched on Spotify, creating playlist "%s" on Spotify...' % (len(spotify_tracks), len(tracks), spotify_playlist_name)),
 
-    token = util.prompt_for_user_token(spotify_username, 'playlist-modify-private')
+    try:
+        sp.trace = False
 
-    if token:
-        try:
-            sp = spotipy.Spotify(auth=token)
-            sp.trace = False
-            playlist = sp.user_playlist_create(spotify_username, spotify_playlist_name, public=False)
-            if len(spotify_tracks) > 100:
-                def chunker(seq, size):
-                    return (seq[pos:pos + size] for pos in xrange(0, len(seq), size))
-                for spotify_tracks_chunk in chunker(spotify_tracks, 100):
-                    results = sp.user_playlist_add_tracks(spotify_username, playlist['id'], spotify_tracks_chunk)
-            else:
-                results = sp.user_playlist_add_tracks(spotify_username, playlist['id'], spotify_tracks)
-        except Exception as e:
-            logger.critical('Spotify error: %s' % str(e))
+        playlist = sp.user_playlist_create(spotify_username, spotify_playlist_name, public=False)
+        if len(spotify_tracks) > 100:
+            def chunker(seq, size):
+                return (seq[pos:pos + size] for pos in xrange(0, len(seq), size))
+            for spotify_tracks_chunk in chunker(spotify_tracks, 100):
+                results = sp.user_playlist_add_tracks(spotify_username, playlist['id'], spotify_tracks_chunk)
         else:
-            print 'done\n'
+            results = sp.user_playlist_add_tracks(spotify_username, playlist['id'], spotify_tracks)
+    except Exception as e:
+        logger.critical('Spotify error: %s' % str(e))
     else:
-        logger.critical('Can\'t get token for %s user' % spotify_username)
+        print('done\n')
