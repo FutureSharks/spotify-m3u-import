@@ -1,18 +1,16 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-import eyed3
 import argparse
 import os
 import sys
 import pprint
 import logging
-import logging.handlers
 import spotipy
-import spotipy.util as util
-from difflib import SequenceMatcher
 from spotipy.oauth2 import SpotifyOAuth
+from difflib import SequenceMatcher
 from termcolor import colored
+from mutagen import File
 
 def parse_arguments():
     p = argparse.ArgumentParser(description='A script to import a m3u playlist into Spotify')
@@ -24,9 +22,9 @@ def parse_arguments():
 def load_playlist_file(playlist_file):
     tracks = []
     try:
-        content = [ line.strip() for line in playlist_file if line.strip() and not line.startswith("#") ]
+        content = [line.strip() for line in playlist_file if line.strip() and not line.startswith("#")]
     except Exception as e:
-        logger.critical('Playlist file "%s" failed load: %s' % (playlist_file, str(e)))
+        logger.critical('Playlist file "%s" failed load: %s' % (playlist_file.name, str(e)))
         sys.exit(1)
     else:
         for track in content:
@@ -44,28 +42,33 @@ def load_playlist_file(playlist_file):
             tracks.append({'path': track})
         return tracks
 
-def read_id3_tags(file_name):
+def read_tags(file_name):
     tag_data = False
     try:
-        track_id3 = eyed3.load(file_name)
+        audio = File(file_name, easy=True)
+        if audio:
+            artist = audio.get('artist', [None])[0]
+            title = audio.get('title', [None])[0]
+            if artist and title:
+                tag_data = {'artist': artist, 'title': title}
+                logger.debug('Tags read from "%s": %s - %s' % (file_name, artist, title))
+            else:
+                logger.debug('No artist/title tags in "%s"' % file_name)
+        else:
+            logger.debug('Unsupported file format for "%s"' % file_name)
     except Exception as e:
-        logger.debug('Track "%s" failed ID3 tag load: %s' % (track, str(e)))
-    else:
-        logger.debug('Reading tags from "%s"' % track)
-        if track_id3.tag is not None:
-            if track_id3.tag.artist is not None and track_id3.tag.title is not None:
-                tag_data = {'artist': track_id3.tag.artist, 'title': track_id3.tag.title}
+        logger.debug('Failed to read tags from "%s": %s' % (file_name, str(e)))
     return tag_data
 
 def guess_missing_track_info(file_name):
     guess = False
     filename = os.path.basename(file_name)
     filename_no_ext = os.path.splitext(filename)[0]
-    track_uri_parts = filename_no_ext.split('-')
-    if len(track_uri_parts) > 1:
-        guess = {'filename': {} }
-        guess['artist'] = track_uri_parts[0].strip()
-        guess['title'] = track_uri_parts[1].strip()
+    for separator in ['-', '_']:
+        track_parts = filename_no_ext.split(separator)
+        if len(track_parts) > 1:
+            guess = {'artist': track_parts[0].strip(), 'title': separator.join(track_parts[1:]).strip()}
+            break
     return guess
 
 def find_spotify_track(track):
@@ -76,7 +79,7 @@ def find_spotify_track(track):
         results_raw = sp.search(q=search_string, limit=30)
         if len(results_raw['tracks']['items']) > 0:
             spotify_results = results_raw['tracks']['items']
-            logger.debug('Spotify results:%s' % len(spotify_results))
+            logger.debug('Spotify results: %s' % len(spotify_results))
             for spotify_result in spotify_results:
                 spotify_result['rank'] = _how_similar(track_name, spotify_result['name'])
                 if spotify_result['rank'] == 1.0:
@@ -87,67 +90,63 @@ def find_spotify_track(track):
         logger.debug('No good Spotify result found')
         return False
     spotify_match_threshold = 0.5
-    # search by id3 tags
-    if track['id3_data'] and 'artist' in track['id3_data'] and 'title' in track['id3_data']:
-        spotify_search_string = '%s %s' % (track['id3_data']['artist'], track['id3_data']['title'])
-        seach_result = _select_result_from_spotify_search(
+    # search by tags
+    if track.get('tag_data') and 'artist' in track['tag_data'] and 'title' in track['tag_data']:
+        spotify_search_string = '%s %s' % (track['tag_data']['artist'], track['tag_data']['title'])
+        search_result = _select_result_from_spotify_search(
             spotify_search_string,
-            track['id3_data']['title'],
+            track['tag_data']['title'],
             spotify_match_threshold
         )
-        if seach_result:
-            return seach_result
+        if search_result:
+            return search_result
     # search by track['guess']
     if 'guess' in track and track['guess'] and 'artist' in track['guess'] and 'title' in track['guess']:
         spotify_search_string = '%s %s' % (track['guess']['artist'], track['guess']['title'])
-        seach_result = _select_result_from_spotify_search(
+        search_result = _select_result_from_spotify_search(
             spotify_search_string,
             track['guess']['title'],
             spotify_match_threshold
         )
-        if seach_result:
-            return seach_result
+        if search_result:
+            return search_result
     return False
 
 def format_track_info(track):
-    if track['id3_data']:
-        formatted_id3_data = '%s - %s' % (repr(track['id3_data']['artist']), repr(track['id3_data']['title']))
+    if track.get('tag_data'):
+        formatted_tag_data = '%s - %s' % (repr(track['tag_data']['artist']), repr(track['tag_data']['title']))
         formatted_guess = 'Not required'
     else:
-        formatted_id3_data = colored('None', 'red')
-        if track['guess']:
+        formatted_tag_data = colored('None', 'red')
+        if track.get('guess'):
             formatted_guess = '%s - %s' % (repr(track['guess']['artist']), repr(track['guess']['title']))
         else:
             formatted_guess = colored('None', 'red')
-    if track['spotify_data']:
+    if track.get('spotify_data'):
         formatted_spotify = colored('%s - %s, %s' % (repr(track['spotify_data']['artist']), repr(track['spotify_data']['title']), repr(track['spotify_data']['id'])), 'green')
     else:
         formatted_spotify = colored('None', 'red')
-    return '\n%s\nIDv3 tag data: %s\nGuess from filename: %s\nSpotify: %s' % (
+    return '\n%s\nTag data: %s\nGuess from filename: %s\nSpotify: %s' % (
         colored(repr(track['path']), 'blue'),
-        formatted_id3_data,
+        formatted_tag_data,
         formatted_guess,
         formatted_spotify
     )
 
-
 if __name__ == "__main__":
     args = parse_arguments()
     spotify_username = args.username
-    # these environment variables should be set
-    # you can create a spotify client id & secret on https://developer.spotify.com/dashboard/
-    # use redirect url 'http://127.0.0.1:8888/callback' (can be non-existing)
-    SPOTIPY_CLIENT_ID = os.getenv("SPOTIPY_CLIENT_ID")
-    SPOTIPY_CLIENT_SECRET = os.getenv("SPOTIPY_CLIENT_SECRET")
-    SPOTIPY_REDIRECT_URI = os.getenv("SPOTIPY_REDIRECT_URI")
 
-    if not SPOTIPY_CLIENT_ID or not SPOTIPY_CLIENT_SECRET or not SPOTIPY_REDIRECT_URI:
-        print("Environment variables SPOTIPY_CLIENT_ID, SPOTIPY_CLIENT_SECRET or SPOTIPY_REDIRECT_URI not set.\n")
-        print("On windows powershell eg.: setx SPOTIPY_CLIENT_ID \"your client id\'")
-        print("On linux eg.: export SPOTIPY_CLIENT_ID=\"your client id\"\n")
-        print("You can create a spotify client id & secret on https://developer.spotify.com/dashboard/")
-        print("For SPOTIPY_REDIRECT_URI, use value 'http://127.0.0.1:8888/callback' (or similar)")
-        exit()
+    SPOTIPY_CLIENT_ID = os.environ.get('SPOTIPY_CLIENT_ID')
+    SPOTIPY_CLIENT_SECRET = os.environ.get('SPOTIPY_CLIENT_SECRET')
+    SPOTIPY_REDIRECT_URI = os.environ.get('SPOTIPY_REDIRECT_URI', 'http://127.0.0.1:8888/callback')  
+
+    if not SPOTIPY_CLIENT_ID or not SPOTIPY_CLIENT_SECRET:
+        print("Environment variables SPOTIPY_CLIENT_ID and SPOTIPY_CLIENT_SECRET must be set.")
+        print("You can create them on https://developer.spotify.com/dashboard/")
+        print("On Windows: setx SPOTIPY_CLIENT_ID \"your-client-id\"")
+        print("On Linux/Mac: export SPOTIPY_CLIENT_ID=\"your-client-id\"")
+        sys.exit(1)
 
     SCOPE = (
         "user-read-private "
@@ -187,7 +186,6 @@ if __name__ == "__main__":
         stdout_level = logging.DEBUG
     else:
         logger.setLevel(logging.CRITICAL)
-        eyed3.log.setLevel("ERROR")
         stdout_level = logging.CRITICAL
 
     tracks = load_playlist_file(args.file)
@@ -195,21 +193,21 @@ if __name__ == "__main__":
     print(colored('Parsed %s tracks from %s' % (len(tracks), args.file.name), 'green'))
 
     for track in tracks:
-        track['id3_data'] = read_id3_tags(track['path'])
-        if not track['id3_data']:
+        track['tag_data'] = read_tags(track['path'])
+        if not track['tag_data']:
             track['guess'] = guess_missing_track_info(track['path'])
         track['spotify_data'] = find_spotify_track(track)
 
         print(format_track_info(track))
 
-    spotify_tracks = [ k['spotify_data']['id'] for k in tracks if k.get('spotify_data') ]
-    spotify_playlist_name = args.file.name
+    spotify_tracks = [k['spotify_data']['id'] for k in tracks if k.get('spotify_data')]
+    spotify_playlist_name = os.path.basename(args.file.name)  # Using basename for playlist name
 
     if len(spotify_tracks) < 1:
         print('\nNo tracks matched on Spotify')
         sys.exit(0)
 
-    print('\n%s/%s of tracks matched on Spotify, creating playlist "%s" on Spotify...' % (len(spotify_tracks), len(tracks), spotify_playlist_name)),
+    print('\n%s/%s of tracks matched on Spotify, creating playlist "%s" on Spotify...' % (len(spotify_tracks), len(tracks), spotify_playlist_name))
 
     try:
         sp.trace = False
@@ -217,7 +215,7 @@ if __name__ == "__main__":
         playlist = sp.user_playlist_create(spotify_username, spotify_playlist_name, public=False)
         if len(spotify_tracks) > 100:
             def chunker(seq, size):
-                return (seq[pos:pos + size] for pos in xrange(0, len(seq), size))
+                return (seq[pos:pos + size] for pos in range(0, len(seq), size))
             for spotify_tracks_chunk in chunker(spotify_tracks, 100):
                 results = sp.user_playlist_add_tracks(spotify_username, playlist['id'], spotify_tracks_chunk)
         else:
